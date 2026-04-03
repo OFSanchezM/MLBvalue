@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import math
 import os
 import aiosqlite
 import httpx
@@ -9,8 +7,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton
+    ReplyKeyboardMarkup
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -48,31 +45,40 @@ async def init_db():
         """)
         await db.commit()
 
-# MODELO
-def probabilidad(era_h, era_a):
-    return era_a / (era_h + era_a) if (era_h + era_a) else 0.5
-
-def value(prob, cuota):
-    return (prob * cuota) - 1
-
-# API
+# UTIL
 async def get_json(url):
     async with httpx.AsyncClient(timeout=10) as client:
-        return (await client.get(url)).json()
+        r = await client.get(url)
+        return r.json()
 
 async def get_odds():
     return await get_json(
         f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
     )
 
+def value(prob, cuota):
+    return (prob * cuota) - 1
+
+# 🔥 CUOTAS CORRECTAS
 def buscar_cuota(home, away, odds):
     for g in odds:
         try:
-            if home.lower() in g["home_team"].lower():
-                o = g["bookmakers"][0]["markets"][0]["outcomes"]
-                return o[0]["price"], o[1]["price"]
+            if g["home_team"].lower() == home.lower() and g["away_team"].lower() == away.lower():
+                outcomes = g["bookmakers"][0]["markets"][0]["outcomes"]
+
+                cuota_h = None
+                cuota_a = None
+
+                for o in outcomes:
+                    if o["name"].lower() == home.lower():
+                        cuota_h = o["price"]
+                    elif o["name"].lower() == away.lower():
+                        cuota_a = o["price"]
+
+                return cuota_h, cuota_a
         except:
             continue
+
     return None, None
 
 # START
@@ -92,7 +98,10 @@ async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for g in d.get("games", []):
             h = g["teams"]["home"]["team"]["name"]
             a = g["teams"]["away"]["team"]["name"]
-            keyboard.append([InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")])
+
+            keyboard.append([
+                InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")
+            ])
 
     if not keyboard:
         await update.message.reply_text("No hay partidos hoy.")
@@ -102,7 +111,7 @@ async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-# DETALLE (ARREGLADO)
+# 🔥 DETALLE SIN ERROR
 async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -110,17 +119,27 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         gid = query.data.split("_")[1]
 
-        game = await get_json(f"{MLB_BASE}/game/{gid}/feed/live")
+        sched = await get_json(f"{MLB_BASE}/schedule?sportId=1")
+
+        game_data = None
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                if str(g["gamePk"]) == gid:
+                    game_data = g
+                    break
+
+        if not game_data:
+            await query.edit_message_text("❌ Partido no encontrado")
+            return
+
+        h = game_data["teams"]["home"]["team"]["name"]
+        a = game_data["teams"]["away"]["team"]["name"]
+
         odds = await get_odds()
-
-        data = game["gameData"]
-        h = data["teams"]["home"]["name"]
-        a = data["teams"]["away"]["name"]
-
         cuota_h, cuota_a = buscar_cuota(h, a, odds)
 
         if not cuota_h:
-            await query.edit_message_text("❌ No hay cuotas disponibles.")
+            await query.edit_message_text("❌ No hay cuotas")
             return
 
         # MODELO SIMPLE
@@ -131,15 +150,9 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val_a = value(prob_a, cuota_a)
 
         if val_h > val_a:
-            pick = h
-            cuota = cuota_h
-            prob = prob_h
-            val = val_h
+            pick, cuota, prob, val = h, cuota_h, prob_h, val_h
         else:
-            pick = a
-            cuota = cuota_a
-            prob = prob_a
-            val = val_a
+            pick, cuota, prob, val = a, cuota_a, prob_a, val_a
 
         texto = (
             f"⚾ {a} @ {h}\n\n"
@@ -161,9 +174,9 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(e)
-        await query.edit_message_text("Error cargando partido")
+        await query.edit_message_text("❌ Error cargando datos")
 
-# PICKS (ARREGLADO)
+# 🔥 PICKS CON GANADOR + FILTRO
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
     odds = await get_odds()
@@ -180,6 +193,10 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not cuota_h:
                 continue
 
+            # 🔥 FILTRO
+            if cuota_h > 5 or cuota_a > 5:
+                continue
+
             prob_h = 0.55
             prob_a = 0.45
 
@@ -187,15 +204,9 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val_a = value(prob_a, cuota_a)
 
             if val_h > val_a:
-                pick = h
-                cuota = cuota_h
-                prob = prob_h
-                val = val_h
+                pick, cuota, prob, val = h, cuota_h, prob_h, val_h
             else:
-                pick = a
-                cuota = cuota_a
-                prob = prob_a
-                val = val_a
+                pick, cuota, prob, val = a, cuota_a, prob_a, val_a
 
             if val > 0.05:
                 texto += (
@@ -212,9 +223,12 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     await db.commit()
 
-    await update.message.reply_text(texto if texto != "🔥 PICKS CON VALUE\n\n" else "No hay value hoy")
+    if texto == "🔥 PICKS CON VALUE\n\n":
+        texto = "No hay picks hoy"
 
-# HISTORIAL (ARREGLADO)
+    await update.message.reply_text(texto)
+
+# HISTORIAL
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT game, pick, cuota FROM picks ORDER BY id DESC LIMIT 5") as cur:
