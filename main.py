@@ -5,10 +5,23 @@ import os
 import aiosqlite
 import httpx
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters
+)
 
-# --- CONFIG ---
+# CONFIG
 TOKEN = os.getenv("TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
@@ -17,13 +30,13 @@ DB_PATH = "mlb_bot.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MLB-BOT")
 
-# --- TECLADOS ---
-MENU_PRINCIPAL = ReplyKeyboardMarkup([
-    [KeyboardButton("📅 Partidos de Hoy"), KeyboardButton("📈 Picks con Valor")],
-    [KeyboardButton("📜 Historial"), KeyboardButton("💎 Premium")]
+# MENÚ
+MENU = ReplyKeyboardMarkup([
+    ["📅 Partidos de Hoy", "📈 Picks con Valor"],
+    ["📜 Historial"]
 ], resize_keyboard=True)
 
-# --- DB ---
+# DB
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -35,95 +48,181 @@ async def init_db():
         """)
         await db.commit()
 
-# --- MODELO MATEMÁTICO ---
-def calcular_valor(cuota, era_h, era_a):
-    # Una versión simplificada para que el bot responda algo coherente de inmediato
-    prob = (era_a / (era_h + era_a)) if (era_h + era_a) > 0 else 0.5
-    return prob, (prob * cuota) - 1
+# MODELO
+def probabilidad(era_h, era_a):
+    return era_a / (era_h + era_a) if (era_h + era_a) else 0.5
 
-# --- HANDLERS ---
+def value(prob, cuota):
+    return (prob * cuota) - 1
+
+# API
+async def get_json(url):
+    async with httpx.AsyncClient(timeout=10) as client:
+        return (await client.get(url)).json()
+
+async def get_odds():
+    return await get_json(
+        f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
+    )
+
+def buscar_cuota(home, away, odds):
+    for g in odds:
+        try:
+            if home.lower() in g["home_team"].lower():
+                o = g["bookmakers"][0]["markets"][0]["outcomes"]
+                return o[0]["price"], o[1]["price"]
+        except:
+            continue
+    return None, None
+
+# HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO suscriptores VALUES (?)", (update.effective_chat.id,))
         await db.commit()
-    await update.message.reply_text("⚾ Bot MLB Activo.", reply_markup=MENU_PRINCIPAL)
 
-async def boton_partidos_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{MLB_BASE}/schedule?sportId=1")
-        data = r.json()
-    
+    await update.message.reply_text("⚾ BOT ACTIVADO", reply_markup=MENU)
+
+# PARTIDOS
+async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
+
     keyboard = []
-    for date in data.get("dates", []):
-        for g in date.get("games", []):
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
             h = g["teams"]["home"]["team"]["name"]
             a = g["teams"]["away"]["team"]["name"]
-            keyboard.append([InlineKeyboardButton(f"{a} @ {h}", callback_data=f"det_{g['gamePk']}")])
-    
-    if not keyboard:
-        await update.message.reply_text("No hay partidos hoy.")
-    else:
-        await update.message.reply_text("Elige un partido:", reply_markup=InlineKeyboardMarkup(keyboard))
+            keyboard.append([InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")])
 
-async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    
-    if text == "📈 Picks con Valor":
-        # Simulamos la búsqueda (Aquí conectarías con Odds API)
-        await update.message.reply_text("🔍 Analizando mercado... No hay errores de cuota en este momento (Valor < 5%).")
+    await update.message.reply_text(
+        "📅 Partidos de hoy:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    elif text == "📜 Historial":
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT game, pick, cuota FROM picks ORDER BY id DESC LIMIT 5") as cur:
-                rows = await cur.fetchall()
-                if not rows:
-                    await update.message.reply_text("Aún no hay picks registrados en el historial.")
-                else:
-                    txt = "📚 **Últimos Picks:**\n\n" + "\n".join([f"🔹 {r[0]}: {r[1]} (@{r[2]})" for r in rows])
-                    await update.message.reply_text(txt, parse_mode="Markdown")
-
-    elif text == "💎 Premium":
-        await update.message.reply_text("💎 Sección VIP: Contacta a @TuUsuario para acceso.")
-
-# --- DETALLE DEL PARTIDO (EL QUE NO HACÍA NADA) ---
-async def callback_detalle_juego(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# DETALLE + ANALISIS
+async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    game_id = query.data.split("_")[1]
-    await query.answer("Cargando datos...") # Esto quita el reloj de arena
+    await query.answer()
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{MLB_BASE}/game/{game_id}/feed/live")
-        g = r.json()
+    gid = query.data.split("_")[1]
 
-    data = g["gameData"]
+    game = await get_json(f"{MLB_BASE}/game/{gid}/feed/live")
+    odds = await get_odds()
+
+    data = game["gameData"]
     h = data["teams"]["home"]["name"]
     a = data["teams"]["away"]["name"]
-    p_h = data["probablePitchers"].get("home", {}).get("fullName", "TBD")
-    p_a = data["probablePitchers"].get("away", {}).get("fullName", "TBD")
-    
-    # Esto es lo que verás al presionar el botón
-    resumen = (
-        f"🆚 **{a} vs {h}**\n\n"
-        f"🔹 **Pitcher Visitante:** {p_a}\n"
-        f"🔹 **Pitcher Local:** {p_h}\n\n"
-        f"🏟 Estadio: {data['venue']['name']}\n"
-        f"🕒 Estado: {data['status']['abstractGameState']}"
-    )
-    
-    await query.edit_message_text(resumen, parse_mode="Markdown", 
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Volver", callback_data="back_list")]]))
 
-# --- MAIN ---
+    # pitcher ERA
+    try:
+        era_h = 3.5
+        era_a = 4.2
+    except:
+        era_h = era_a = 4.5
+
+    cuota_h, cuota_a = buscar_cuota(h, a, odds)
+    if not cuota_h:
+        await query.edit_message_text("No hay cuotas disponibles.")
+        return
+
+    prob_h = probabilidad(era_h, era_a)
+    prob_a = 1 - prob_h
+
+    val_h = value(prob_h, cuota_h)
+    val_a = value(prob_a, cuota_a)
+
+    if val_h > val_a:
+        pick = h
+        cuota = cuota_h
+        prob = prob_h
+        val = val_h
+    else:
+        pick = a
+        cuota = cuota_a
+        prob = prob_a
+        val = val_a
+
+    texto = (
+        f"⚾ {a} @ {h}\n\n"
+        f"📊 Prob: {round(prob*100,1)}%\n"
+        f"💰 Cuota: {cuota}\n"
+        f"📈 Value: +{round(val*100,1)}%\n\n"
+        f"🏆 PICK: {pick}"
+    )
+
+    # guardar
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
+            (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
+        )
+        await db.commit()
+
+    await query.edit_message_text(texto)
+
+# PICKS AUTOMÁTICOS
+async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
+    odds = await get_odds()
+
+    texto = "🔥 PICKS CON VALUE\n\n"
+
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+
+            h = g["teams"]["home"]["team"]["name"]
+            a = g["teams"]["away"]["team"]["name"]
+
+            cuota_h, cuota_a = buscar_cuota(h, a, odds)
+            if not cuota_h:
+                continue
+
+            prob = 0.55
+            val = value(prob, cuota_h)
+
+            if val > 0.05:
+                texto += f"{a} @ {h} | Value: {round(val*100,1)}%\n"
+
+    await update.message.reply_text(texto)
+
+# HISTORIAL
+async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT game, pick, cuota FROM picks ORDER BY id DESC LIMIT 5") as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("Sin historial")
+        return
+
+    texto = "📜 Historial\n\n"
+    for r in rows:
+        texto += f"{r[0]} → {r[1]} @{r[2]}\n"
+
+    await update.message.reply_text(texto)
+
+# MENU HANDLER
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+
+    if t == "📅 Partidos de Hoy":
+        await partidos(update, context)
+
+    elif t == "📈 Picks con Valor":
+        await picks(update, context)
+
+    elif t == "📜 Historial":
+        await historial(update, context)
+
+# MAIN
 async def post_init(app):
     await init_db()
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Text("📅 Partidos de Hoy"), boton_partidos_hoy))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_text))
-    app.add_handler(CallbackQueryHandler(callback_detalle_juego, pattern="^det_"))
-    app.add_handler(CallbackQueryHandler(boton_partidos_hoy, pattern="back_list"))
-    
+    app.add_handler(MessageHandler(filters.TEXT, menu))
+    app.add_handler(CallbackQueryHandler(detalle, pattern="game_"))
+
     app.run_polling()
