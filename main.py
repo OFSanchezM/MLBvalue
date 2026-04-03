@@ -1,5 +1,7 @@
 import logging
 import os
+import math
+import asyncio
 import aiosqlite
 import httpx
 from datetime import datetime
@@ -15,7 +17,6 @@ DB_PATH = "mlb_bot.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MLB-BOT")
 
-# MENU
 MENU = ReplyKeyboardMarkup([
     ["📅 Partidos de Hoy", "📈 Picks con Valor"],
     ["📜 Historial"]
@@ -33,235 +34,219 @@ async def init_db():
         """)
         await db.commit()
 
-# UTIL
-async def get_json(url):
+# HTTP
+async def get_json(url, params=None):
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url)
+        r = await client.get(url, params=params)
         return r.json()
 
+# STATS
+async def era_pitcher(pid):
+    if not pid: return 4.50
+    try:
+        d = await get_json(f"{MLB_BASE}/people/{pid}?hydrate=stats(group=[pitching],type=[season])")
+        return float(d["people"][0]["stats"][0]["splits"][0]["stat"]["era"])
+    except: return 4.50
+
+async def mano_pitcher(pid):
+    if not pid: return "R"
+    try:
+        d = await get_json(f"{MLB_BASE}/people/{pid}")
+        return d["people"][0]["pitchHand"]["code"]
+    except: return "R"
+
+async def bullpen(team):
+    try:
+        d = await get_json(f"{MLB_BASE}/teams/{team}/stats", {"stats":"season","group":"pitching","pitcherStat":"relief"})
+        return float(d["stats"][0]["splits"][0]["stat"]["era"])
+    except: return 4.20
+
+async def ops(team):
+    try:
+        d = await get_json(f"{MLB_BASE}/teams/{team}/stats", {"stats":"season","group":"hitting"})
+        return float(d["stats"][0]["splits"][0]["stat"]["ops"])
+    except: return 0.720
+
+async def winpct(team):
+    try:
+        d = await get_json(f"{MLB_BASE}/standings", {"leagueId":"103,104"})
+        for r in d["records"]:
+            for t in r["teamRecords"]:
+                if t["team"]["id"] == team:
+                    return float(t["winningPercentage"])
+    except: pass
+    return 0.5
+
+# MODELO
+def ratio(a,b,inv=False):
+    if inv: return math.log(b)/(math.log(a)+math.log(b))
+    return math.log(a)/(math.log(a)+math.log(b))
+
+def prob_model(era_h,era_a,bp_h,bp_a,ops_h,ops_a,w_h,w_a):
+    return (
+        ratio(era_h,era_a,True)*0.30 +
+        ratio(bp_h,bp_a,True)*0.25 +
+        ratio(ops_h,ops_a)*0.25 +
+        ratio(w_h,w_a)*0.15 +
+        0.54*0.05
+    )
+
+def ajuste_mano(prob, mano_pitcher, ops_equipo):
+    if mano_pitcher == "L":
+        ajuste = (ops_equipo - 0.720) * 0.8
+    else:
+        ajuste = (ops_equipo - 0.720) * 0.5
+    return max(min(prob + ajuste, 0.92), 0.08)
+
+def value(prob,cuota): return prob*cuota-1
+
+# ODDS
 async def get_odds():
     return await get_json(
-        f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
+        "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
+        {"apiKey":ODDS_API_KEY,"regions":"eu","markets":"h2h"}
     )
 
-def value(prob, cuota):
-    return (prob * cuota) - 1
-
-# CUOTAS CORRECTAS
-def buscar_cuota(home, away, odds):
+def buscar_cuota(home,away,odds):
     for g in odds:
         try:
-            if g["home_team"].lower() == home.lower() and g["away_team"].lower() == away.lower():
-                outcomes = g["bookmakers"][0]["markets"][0]["outcomes"]
-
-                cuota_h = None
-                cuota_a = None
-
-                for o in outcomes:
-                    if o["name"].lower() == home.lower():
-                        cuota_h = o["price"]
-                    elif o["name"].lower() == away.lower():
-                        cuota_a = o["price"]
-
-                return cuota_h, cuota_a
-        except:
-            continue
-
-    return None, None
+            if g["home_team"].lower()==home.lower() and g["away_team"].lower()==away.lower():
+                o=g["bookmakers"][0]["markets"][0]["outcomes"]
+                ch=next(x["price"] for x in o if x["name"].lower()==home.lower())
+                ca=next(x["price"] for x in o if x["name"].lower()==away.lower())
+                return ch,ca
+        except: continue
+    return None,None
 
 # START
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update,context):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO suscriptores VALUES (?)", (update.effective_chat.id,))
+        await db.execute("INSERT OR IGNORE INTO suscriptores VALUES (?)",(update.effective_chat.id,))
         await db.commit()
-
-    await update.message.reply_text("⚾ BOT ACTIVADO", reply_markup=MENU)
+    await update.message.reply_text("⚾ BOT ACTIVO",reply_markup=MENU)
 
 # PARTIDOS
-async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
-
-    keyboard = []
-    for d in data.get("dates", []):
-        for g in d.get("games", []):
-            h = g["teams"]["home"]["team"]["name"]
-            a = g["teams"]["away"]["team"]["name"]
-
-            keyboard.append([
-                InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")
-            ])
-
-    await update.message.reply_text(
-        "📅 Partidos de hoy:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+async def partidos(update,context):
+    data=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
+    kb=[]
+    for d in data.get("dates",[]):
+        for g in d.get("games",[]):
+            h=g["teams"]["home"]["team"]["name"]
+            a=g["teams"]["away"]["team"]["name"]
+            kb.append([InlineKeyboardButton(f"{a} @ {h}",callback_data=f"g_{g['gamePk']}")])
+    await update.message.reply_text("📅 Partidos:",reply_markup=InlineKeyboardMarkup(kb))
 
 # DETALLE
-async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def detalle(update,context):
+    q=update.callback_query
+    await q.answer()
 
-    try:
-        gid = query.data.split("_")[1]
+    gid=q.data.split("_")[1]
+    sched=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
 
-        sched = await get_json(f"{MLB_BASE}/schedule?sportId=1")
+    game=None
+    for d in sched.get("dates",[]):
+        for g in d.get("games",[]):
+            if str(g["gamePk"])==gid: game=g
 
-        game_data = None
-        for d in sched.get("dates", []):
-            for g in d.get("games", []):
-                if str(g["gamePk"]) == gid:
-                    game_data = g
-                    break
+    if not game:
+        await q.edit_message_text("No encontrado");return
 
-        if not game_data:
-            await query.edit_message_text("❌ Partido no encontrado")
-            return
+    h=game["teams"]["home"]["team"]
+    a=game["teams"]["away"]["team"]
 
-        h = game_data["teams"]["home"]["team"]["name"]
-        a = game_data["teams"]["away"]["team"]["name"]
+    odds=await get_odds()
+    ch,ca=buscar_cuota(h["name"],a["name"],odds)
+    if not ch: await q.edit_message_text("Sin cuotas");return
 
-        odds = await get_odds()
-        cuota_h, cuota_a = buscar_cuota(h, a, odds)
+    era_h,era_a,bp_h,bp_a,ops_h,ops_a,w_h,w_a,mano_h,mano_a=await asyncio.gather(
+        era_pitcher(h.get("probablePitcher",{}).get("id")),
+        era_pitcher(a.get("probablePitcher",{}).get("id")),
+        bullpen(h["id"]),bullpen(a["id"]),
+        ops(h["id"]),ops(a["id"]),
+        winpct(h["id"]),winpct(a["id"]),
+        mano_pitcher(h.get("probablePitcher",{}).get("id")),
+        mano_pitcher(a.get("probablePitcher",{}).get("id")),
+    )
 
-        if not cuota_h:
-            await query.edit_message_text("❌ No hay cuotas")
-            return
+    ph=prob_model(era_h,era_a,bp_h,bp_a,ops_h,ops_a,w_h,w_a)
+    pa=1-ph
 
-        # 🔥 MODELO REAL BASADO EN CUOTAS
-        prob_h = 1 / cuota_h
-        prob_a = 1 / cuota_a
+    ph=ajuste_mano(ph,mano_a,ops_h)
+    pa=ajuste_mano(pa,mano_h,ops_a)
 
-        total = prob_h + prob_a
-        prob_h /= total
-        prob_a /= total
+    vh,va=value(ph,ch),value(pa,ca)
 
-        # pequeño edge
-        prob_h *= 1.05
-        prob_a *= 1.05
+    if vh>va: pick,cuota,prob,val=h["name"],ch,ph,vh
+    else: pick,cuota,prob,val=a["name"],ca,pa,va
 
-        val_h = value(prob_h, cuota_h)
-        val_a = value(prob_a, cuota_a)
+    txt=(
+        f"⚾ {a['name']} @ {h['name']}\n\n"
+        f"📊 Prob: {round(prob*100,1)}%\n"
+        f"💰 Cuota: {cuota}\n"
+        f"📈 Value: +{round(val*100,1)}%\n\n"
+        f"🏆 PICK: {pick}\n\n"
+        f"🧠 Pitchers:\n"
+        f"{round(era_h,2)} ({mano_h}) vs {round(era_a,2)} ({mano_a})\n"
+        f"📉 Bullpen: {round(bp_h,2)} vs {round(bp_a,2)}\n"
+        f"⚾ OPS: {round(ops_h,3)} vs {round(ops_a,3)}"
+    )
 
-        if val_h > val_a:
-            pick, cuota, prob, val = h, cuota_h, prob_h, val_h
-        else:
-            pick, cuota, prob, val = a, cuota_a, prob_a, val_a
-
-        texto = (
-            f"⚾ {a} @ {h}\n\n"
-            f"📊 Prob: {round(prob*100,1)}%\n"
-            f"💰 Cuota: {cuota}\n"
-            f"📈 Value: +{round(val*100,1)}%\n\n"
-            f"🏆 PICK: {pick}"
-        )
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
-                (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
-            )
-            await db.commit()
-
-        await query.edit_message_text(texto)
-
-    except Exception as e:
-        logger.error(e)
-        await query.edit_message_text("❌ Error cargando datos")
+    await q.edit_message_text(txt)
 
 # PICKS
-async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
-    odds = await get_odds()
+async def picks(update,context):
+    data=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
+    odds=await get_odds()
+    txt="🔥 PICKS\n\n"
 
-    texto = "🔥 PICKS CON VALUE\n\n"
+    for d in data.get("dates",[]):
+        for g in d.get("games",[]):
+            h=g["teams"]["home"]["team"]
+            a=g["teams"]["away"]["team"]
 
-    for d in data.get("dates", []):
-        for g in d.get("games", []):
+            ch,ca=buscar_cuota(h["name"],a["name"],odds)
+            if not ch or ch>5 or ca>5: continue
 
-            h = g["teams"]["home"]["team"]["name"]
-            a = g["teams"]["away"]["team"]["name"]
-
-            cuota_h, cuota_a = buscar_cuota(h, a, odds)
-            if not cuota_h:
-                continue
-
-            # FILTRO
-            if cuota_h > 5 or cuota_a > 5:
-                continue
-
-            # 🔥 MODELO REAL
-            prob_h = 1 / cuota_h
-            prob_a = 1 / cuota_a
-
-            total = prob_h + prob_a
-            prob_h /= total
-            prob_a /= total
-
-            prob_h *= 1.05
-            prob_a *= 1.05
-
-            val_h = value(prob_h, cuota_h)
-            val_a = value(prob_a, cuota_a)
-
-            if val_h > val_a:
-                pick, cuota, prob, val = h, cuota_h, prob_h, val_h
-            else:
-                pick, cuota, prob, val = a, cuota_a, prob_a, val_a
-
-            # 🔥 FILTRO VALUE REAL
-            if val < 0.03 or val > 0.25:
-                continue
-
-            texto += (
-                f"{a} @ {h}\n"
-                f"🏆 {pick}\n"
-                f"💰 {cuota} | 📈 +{round(val*100,1)}%\n\n"
+            era_h,era_a,bp_h,bp_a,ops_h,ops_a,w_h,w_a,mano_h,mano_a=await asyncio.gather(
+                era_pitcher(h.get("probablePitcher",{}).get("id")),
+                era_pitcher(a.get("probablePitcher",{}).get("id")),
+                bullpen(h["id"]),bullpen(a["id"]),
+                ops(h["id"]),ops(a["id"]),
+                winpct(h["id"]),winpct(a["id"]),
+                mano_pitcher(h.get("probablePitcher",{}).get("id")),
+                mano_pitcher(a.get("probablePitcher",{}).get("id")),
             )
 
-    if texto == "🔥 PICKS CON VALUE\n\n":
-        texto = "No hay picks hoy"
+            ph=prob_model(era_h,era_a,bp_h,bp_a,ops_h,ops_a,w_h,w_a)
+            pa=1-ph
 
-    await update.message.reply_text(texto)
+            ph=ajuste_mano(ph,mano_a,ops_h)
+            pa=ajuste_mano(pa,mano_h,ops_a)
 
-# HISTORIAL
-async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT game, pick, cuota FROM picks ORDER BY id DESC LIMIT 5") as cur:
-            rows = await cur.fetchall()
+            vh,va=value(ph,ch),value(pa,ca)
 
-    if not rows:
-        await update.message.reply_text("Sin historial aún.")
-        return
+            if vh>va: pick,cuota,prob,val=h["name"],ch,ph,vh
+            else: pick,cuota,prob,val=a["name"],ca,pa,va
 
-    texto = "📜 HISTORIAL\n\n"
-    for r in rows:
-        texto += f"{r[0]} → {r[1]} @{r[2]}\n"
+            if val<0.03 or val>0.25: continue
 
-    await update.message.reply_text(texto)
+            txt+=f"{a['name']} @ {h['name']}\n🏆 {pick}\n💰 {cuota} | +{round(val*100,1)}%\n\n"
+
+    await update.message.reply_text(txt if txt!="🔥 PICKS\n\n" else "No hay value")
 
 # MENU
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text
-
-    if t == "📅 Partidos de Hoy":
-        await partidos(update, context)
-
-    elif t == "📈 Picks con Valor":
-        await picks(update, context)
-
-    elif t == "📜 Historial":
-        await historial(update, context)
+async def menu(update,context):
+    t=update.message.text
+    if t=="📅 Partidos de Hoy": await partidos(update,context)
+    elif t=="📈 Picks con Valor": await picks(update,context)
 
 # MAIN
-async def post_init(app):
-    await init_db()
+async def post_init(app): await init_db()
 
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    app.add_handler(CallbackQueryHandler(detalle, pattern="game_"))
-
-    logger.info("BOT INICIADO")
+if __name__=="__main__":
+    app=ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,menu))
+    app.add_handler(CallbackQueryHandler(detalle,pattern="g_"))
     app.run_polling()
