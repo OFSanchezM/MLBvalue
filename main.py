@@ -3,20 +3,8 @@ import os
 import aiosqlite
 import httpx
 from datetime import datetime
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 # CONFIG
 TOKEN = os.getenv("TOKEN")
@@ -59,7 +47,7 @@ async def get_odds():
 def value(prob, cuota):
     return (prob * cuota) - 1
 
-# 🔥 CUOTAS CORRECTAS
+# CUOTAS CORRECTAS
 def buscar_cuota(home, away, odds):
     for g in odds:
         try:
@@ -103,15 +91,12 @@ async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")
             ])
 
-    if not keyboard:
-        await update.message.reply_text("No hay partidos hoy.")
-    else:
-        await update.message.reply_text(
-            "📅 Partidos de hoy:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    await update.message.reply_text(
+        "📅 Partidos de hoy:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-# 🔥 DETALLE SIN ERROR
+# DETALLE
 async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -142,9 +127,17 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ No hay cuotas")
             return
 
-        # MODELO SIMPLE
-        prob_h = 0.55
-        prob_a = 0.45
+        # 🔥 MODELO REAL BASADO EN CUOTAS
+        prob_h = 1 / cuota_h
+        prob_a = 1 / cuota_a
+
+        total = prob_h + prob_a
+        prob_h /= total
+        prob_a /= total
+
+        # pequeño edge
+        prob_h *= 1.05
+        prob_a *= 1.05
 
         val_h = value(prob_h, cuota_h)
         val_a = value(prob_a, cuota_a)
@@ -162,7 +155,6 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 PICK: {pick}"
         )
 
-        # GUARDAR
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
@@ -176,7 +168,7 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(e)
         await query.edit_message_text("❌ Error cargando datos")
 
-# 🔥 PICKS CON GANADOR + FILTRO
+# PICKS
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
     odds = await get_odds()
@@ -193,12 +185,20 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not cuota_h:
                 continue
 
-            # 🔥 FILTRO
+            # FILTRO
             if cuota_h > 5 or cuota_a > 5:
                 continue
 
-            prob_h = 0.55
-            prob_a = 0.45
+            # 🔥 MODELO REAL
+            prob_h = 1 / cuota_h
+            prob_a = 1 / cuota_a
+
+            total = prob_h + prob_a
+            prob_h /= total
+            prob_a /= total
+
+            prob_h *= 1.05
+            prob_a *= 1.05
 
             val_h = value(prob_h, cuota_h)
             val_a = value(prob_a, cuota_a)
@@ -208,20 +208,15 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 pick, cuota, prob, val = a, cuota_a, prob_a, val_a
 
-            if val > 0.05:
-                texto += (
-                    f"{a} @ {h}\n"
-                    f"🏆 {pick}\n"
-                    f"💰 {cuota} | 📈 +{round(val*100,1)}%\n\n"
-                )
+            # 🔥 FILTRO VALUE REAL
+            if val < 0.03 or val > 0.25:
+                continue
 
-                # GUARDAR
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
-                        (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
-                    )
-                    await db.commit()
+            texto += (
+                f"{a} @ {h}\n"
+                f"🏆 {pick}\n"
+                f"💰 {cuota} | 📈 +{round(val*100,1)}%\n\n"
+            )
 
     if texto == "🔥 PICKS CON VALUE\n\n":
         texto = "No hay picks hoy"
