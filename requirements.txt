@@ -1,3 +1,2 @@
-python-telegram-bot==20.7
-httpx
-apscheduler
+python-telegram-bot[job-queue]==20.7
+apscheduler==3.10.4
