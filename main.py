@@ -30,7 +30,7 @@ DB_PATH = "mlb_bot.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MLB-BOT")
 
-# MENÚ
+# MENU
 MENU = ReplyKeyboardMarkup([
     ["📅 Partidos de Hoy", "📈 Picks con Valor"],
     ["📜 Historial"]
@@ -75,7 +75,7 @@ def buscar_cuota(home, away, odds):
             continue
     return None, None
 
-# HANDLERS
+# START
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO suscriptores VALUES (?)", (update.effective_chat.id,))
@@ -94,73 +94,76 @@ async def partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             a = g["teams"]["away"]["team"]["name"]
             keyboard.append([InlineKeyboardButton(f"{a} @ {h}", callback_data=f"game_{g['gamePk']}")])
 
-    await update.message.reply_text(
-        "📅 Partidos de hoy:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if not keyboard:
+        await update.message.reply_text("No hay partidos hoy.")
+    else:
+        await update.message.reply_text(
+            "📅 Partidos de hoy:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-# DETALLE + ANALISIS
+# DETALLE (ARREGLADO)
 async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    gid = query.data.split("_")[1]
-
-    game = await get_json(f"{MLB_BASE}/game/{gid}/feed/live")
-    odds = await get_odds()
-
-    data = game["gameData"]
-    h = data["teams"]["home"]["name"]
-    a = data["teams"]["away"]["name"]
-
-    # pitcher ERA
     try:
-        era_h = 3.5
-        era_a = 4.2
-    except:
-        era_h = era_a = 4.5
+        gid = query.data.split("_")[1]
 
-    cuota_h, cuota_a = buscar_cuota(h, a, odds)
-    if not cuota_h:
-        await query.edit_message_text("No hay cuotas disponibles.")
-        return
+        game = await get_json(f"{MLB_BASE}/game/{gid}/feed/live")
+        odds = await get_odds()
 
-    prob_h = probabilidad(era_h, era_a)
-    prob_a = 1 - prob_h
+        data = game["gameData"]
+        h = data["teams"]["home"]["name"]
+        a = data["teams"]["away"]["name"]
 
-    val_h = value(prob_h, cuota_h)
-    val_a = value(prob_a, cuota_a)
+        cuota_h, cuota_a = buscar_cuota(h, a, odds)
 
-    if val_h > val_a:
-        pick = h
-        cuota = cuota_h
-        prob = prob_h
-        val = val_h
-    else:
-        pick = a
-        cuota = cuota_a
-        prob = prob_a
-        val = val_a
+        if not cuota_h:
+            await query.edit_message_text("❌ No hay cuotas disponibles.")
+            return
 
-    texto = (
-        f"⚾ {a} @ {h}\n\n"
-        f"📊 Prob: {round(prob*100,1)}%\n"
-        f"💰 Cuota: {cuota}\n"
-        f"📈 Value: +{round(val*100,1)}%\n\n"
-        f"🏆 PICK: {pick}"
-    )
+        # MODELO SIMPLE
+        prob_h = 0.55
+        prob_a = 0.45
 
-    # guardar
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
-            (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
+        val_h = value(prob_h, cuota_h)
+        val_a = value(prob_a, cuota_a)
+
+        if val_h > val_a:
+            pick = h
+            cuota = cuota_h
+            prob = prob_h
+            val = val_h
+        else:
+            pick = a
+            cuota = cuota_a
+            prob = prob_a
+            val = val_a
+
+        texto = (
+            f"⚾ {a} @ {h}\n\n"
+            f"📊 Prob: {round(prob*100,1)}%\n"
+            f"💰 Cuota: {cuota}\n"
+            f"📈 Value: +{round(val*100,1)}%\n\n"
+            f"🏆 PICK: {pick}"
         )
-        await db.commit()
 
-    await query.edit_message_text(texto)
+        # GUARDAR
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
+                (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
+            )
+            await db.commit()
 
-# PICKS AUTOMÁTICOS
+        await query.edit_message_text(texto)
+
+    except Exception as e:
+        logger.error(e)
+        await query.edit_message_text("Error cargando partido")
+
+# PICKS (ARREGLADO)
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_json(f"{MLB_BASE}/schedule?sportId=1")
     odds = await get_odds()
@@ -177,31 +180,57 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not cuota_h:
                 continue
 
-            prob = 0.55
-            val = value(prob, cuota_h)
+            prob_h = 0.55
+            prob_a = 0.45
+
+            val_h = value(prob_h, cuota_h)
+            val_a = value(prob_a, cuota_a)
+
+            if val_h > val_a:
+                pick = h
+                cuota = cuota_h
+                prob = prob_h
+                val = val_h
+            else:
+                pick = a
+                cuota = cuota_a
+                prob = prob_a
+                val = val_a
 
             if val > 0.05:
-                texto += f"{a} @ {h} | Value: {round(val*100,1)}%\n"
+                texto += (
+                    f"{a} @ {h}\n"
+                    f"🏆 {pick}\n"
+                    f"💰 {cuota} | 📈 +{round(val*100,1)}%\n\n"
+                )
 
-    await update.message.reply_text(texto)
+                # GUARDAR
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT INTO picks (game, pick, cuota, prob, value, fecha) VALUES (?,?,?,?,?,?)",
+                        (f"{a}@{h}", pick, cuota, prob, val, datetime.now().isoformat())
+                    )
+                    await db.commit()
 
-# HISTORIAL
+    await update.message.reply_text(texto if texto != "🔥 PICKS CON VALUE\n\n" else "No hay value hoy")
+
+# HISTORIAL (ARREGLADO)
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT game, pick, cuota FROM picks ORDER BY id DESC LIMIT 5") as cur:
             rows = await cur.fetchall()
 
     if not rows:
-        await update.message.reply_text("Sin historial")
+        await update.message.reply_text("Sin historial aún.")
         return
 
-    texto = "📜 Historial\n\n"
+    texto = "📜 HISTORIAL\n\n"
     for r in rows:
         texto += f"{r[0]} → {r[1]} @{r[2]}\n"
 
     await update.message.reply_text(texto)
 
-# MENU HANDLER
+# MENU
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
 
@@ -222,7 +251,8 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT, menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
     app.add_handler(CallbackQueryHandler(detalle, pattern="game_"))
 
+    logger.info("BOT INICIADO")
     app.run_polling()
