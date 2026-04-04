@@ -1,247 +1,417 @@
-import logging
 import os
-import math
+import logging
 import asyncio
-import aiosqlite
 import httpx
+import asyncpg
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+ 
+# ================= CONFIG =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+ 
 TOKEN = os.getenv("TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-MLB_BASE = "https://statsapi.mlb.com/api/v1"
-DB_PATH = "mlb_bot.db"
-
-logging.basicConfig(level=logging.INFO)
-
-MENU = ReplyKeyboardMarkup([
-    ["📅 Partidos de Hoy", "📈 Picks con Valor"]
-], resize_keyboard=True)
-
-# ---------------- HTTP ----------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+MLB = "https://statsapi.mlb.com/api/v1"
+ 
+pool = None
+ 
+# ================= DB =================
+async def init_db():
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL)
+ 
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS historial (
+            id SERIAL PRIMARY KEY,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            game_id TEXT,
+            local TEXT,
+            visitante TEXT,
+            pick TEXT,
+            cuota REAL,
+            prob REAL,
+            value REAL,
+            resultado TEXT DEFAULT 'PENDIENTE',
+            profit REAL DEFAULT 0
+        );
+        """)
+    logger.info("DB inicializada correctamente")
+ 
+# ================= HTTP =================
 async def get_json(url, params=None):
-    async with httpx.AsyncClient(timeout=10) as client:
-        return (await client.get(url, params=params)).json()
-
-# ---------------- CONTEXTO REAL ----------------
-async def resultado_ayer(team_id):
-    try:
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        data = await get_json(f"{MLB_BASE}/schedule", {
-            "sportId": 1,
-            "date": ayer
-        })
-
-        for d in data.get("dates", []):
-            for g in d.get("games", []):
-                if g["status"]["detailedState"] == "Final":
-                    h = g["teams"]["home"]
-                    a = g["teams"]["away"]
-
-                    if h["team"]["id"] == team_id:
-                        return h["isWinner"]
-                    if a["team"]["id"] == team_id:
-                        return a["isWinner"]
-    except:
-        pass
-
-    return None
-
-async def fatiga_bullpen(team_id):
-    return 0.04  # 🔥 ahora SI impacta
-
-# ---------------- STATS ----------------
-async def era_pitcher(pid):
-    if not pid: return 4.50
-    try:
-        d = await get_json(f"{MLB_BASE}/people/{pid}?hydrate=stats(group=[pitching],type=[season])")
-        return float(d["people"][0]["stats"][0]["splits"][0]["stat"]["era"])
-    except:
+    async with httpx.AsyncClient(timeout=10) as c:
+        resp = await c.get(url, params=params)
+        resp.raise_for_status()
+        return resp.json()
+ 
+# ================= STATS =================
+async def era(pid):
+    if not pid:
+        logger.debug("Pitcher ID no disponible, usando ERA por defecto")
         return 4.50
-
+    try:
+        d = await get_json(f"{MLB}/people/{pid}?hydrate=stats(group=[pitching],type=[season])")
+        return float(d["people"][0]["stats"][0]["splits"][0]["stat"]["era"])
+    except Exception as e:
+        logger.warning(f"Error obteniendo ERA para pitcher {pid}: {e}")
+        return 4.50
+ 
 async def ops(team):
     try:
-        d = await get_json(f"{MLB_BASE}/teams/{team}/stats", {"stats":"season","group":"hitting"})
+        d = await get_json(f"{MLB}/teams/{team}/stats", {"stats": "season", "group": "hitting"})
         return float(d["stats"][0]["splits"][0]["stat"]["ops"])
-    except:
+    except Exception as e:
+        logger.warning(f"Error obteniendo OPS para equipo {team}: {e}")
         return 0.720
-
-async def winpct(team):
-    return 0.5
-
-# ---------------- MODELO REBALANCEADO ----------------
-def ratio(a,b,inv=False):
-    if inv:
-        return math.log(b)/(math.log(a)+math.log(b))
-    return math.log(a)/(math.log(a)+math.log(b))
-
-def prob_model(era_h,era_a,ops_h,ops_a):
-    return (
-        ratio(era_h,era_a,True)*0.25 +
-        ratio(ops_h,ops_a)*0.25 +
-        0.5*0.50   # 🔥 neutral fuerte
-    )
-
-def value(prob,cuota):
-    return prob*cuota - 1
-
-# ---------------- ODDS ----------------
+ 
+async def bullpen(team):
+    try:
+        d = await get_json(
+            f"{MLB}/teams/{team}/stats",
+            {"stats": "season", "group": "pitching", "pitcherStat": "relief"}
+        )
+        return float(d["stats"][0]["splits"][0]["stat"]["era"])
+    except Exception as e:
+        logger.warning(f"Error obteniendo bullpen ERA para equipo {team}: {e}")
+        return 4.20
+ 
+# ================= CONTEXTO =================
+async def racha(team):
+    start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        data = await get_json(f"{MLB}/schedule", {"sportId": 1, "startDate": start})
+    except Exception as e:
+        logger.warning(f"Error obteniendo racha para equipo {team}: {e}")
+        return 0.5
+ 
+    wins = 0
+    games = 0
+ 
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            if g["status"]["detailedState"] == "Final":
+                h = g["teams"]["home"]
+                a = g["teams"]["away"]
+ 
+                if h["team"]["id"] == team:
+                    games += 1
+                    if h["isWinner"]:
+                        wins += 1
+                if a["team"]["id"] == team:
+                    games += 1
+                    if a["isWinner"]:
+                        wins += 1
+ 
+    return wins / games if games else 0.5
+ 
+async def resultado_ayer(team):
+    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        data = await get_json(f"{MLB}/schedule", {"sportId": 1, "date": ayer})
+    except Exception as e:
+        logger.warning(f"Error obteniendo resultado de ayer para equipo {team}: {e}")
+        return None
+ 
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            if g["status"]["detailedState"] == "Final":
+                h = g["teams"]["home"]
+                a = g["teams"]["away"]
+ 
+                if h["team"]["id"] == team:
+                    return h["isWinner"]
+                if a["team"]["id"] == team:
+                    return a["isWinner"]
+    return None
+ 
+# ================= MODELO =================
+def modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, r_h, r_a):
+    score = 0.5
+    score += (era_a - era_h) * 0.10
+    score += (ops_h - ops_a) * 1.8
+    score += (bp_a - bp_h) * 0.06
+    score += (r_h - r_a) * 0.25
+    return max(min(score, 0.80), 0.20)
+ 
+def value(prob, cuota):
+    return prob - (1 / cuota)
+ 
+# ================= ODDS =================
 async def get_odds():
-    return await get_json(
-        "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
-        {"apiKey":ODDS_API_KEY,"regions":"eu","markets":"h2h"}
-    )
-
-def buscar_cuota(home,away,odds):
-    for g in odds:
+    """Llama a la API una sola vez y devuelve todos los datos."""
+    try:
+        return await get_json(
+            "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
+            {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h"}
+        )
+    except Exception as e:
+        logger.error(f"Error obteniendo odds: {e}")
+        return []
+ 
+def cuota(home, data):
+    for g in data:
         try:
-            if g["home_team"].lower()==home.lower():
-                o=g["bookmakers"][0]["markets"][0]["outcomes"]
-                ch=o[0]["price"]
-                ca=o[1]["price"]
-                return ch,ca
-        except:
-            continue
-    return None,None
-
-# ---------------- PARTIDOS ----------------
-async def partidos(update,context):
-    data=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
-    kb=[]
-    for d in data.get("dates",[]):
-        for g in d.get("games",[]):
-            h=g["teams"]["home"]["team"]["name"]
-            a=g["teams"]["away"]["team"]["name"]
-            kb.append([InlineKeyboardButton(f"{a} @ {h}",callback_data=f"g_{g['gamePk']}")])
-
-    await update.message.reply_text("📅 Partidos:",reply_markup=InlineKeyboardMarkup(kb))
-
-# ---------------- DETALLE ----------------
-async def detalle(update,context):
-    q=update.callback_query
-    await q.answer()
-
-    gid=q.data.split("_")[1]
-    sched=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
-
-    for d in sched.get("dates",[]):
-        for g in d.get("games",[]):
-            if str(g["gamePk"])==gid:
-
-                h=g["teams"]["home"]["team"]
-                a=g["teams"]["away"]["team"]
-
-                odds=await get_odds()
-                ch,ca=buscar_cuota(h["name"],a["name"],odds)
-
-                era_h,era_a,ops_h,ops_a,res_h,res_a=await asyncio.gather(
-                    era_pitcher(h.get("probablePitcher",{}).get("id")),
-                    era_pitcher(a.get("probablePitcher",{}).get("id")),
-                    ops(h["id"]),ops(a["id"]),
-                    resultado_ayer(h["id"]),
-                    resultado_ayer(a["id"])
-                )
-
-                ph=prob_model(era_h,era_a,ops_h,ops_a)
-                pa=1-ph
-
-                # 💣 REBOTE AGRESIVO
-                if res_h is True:
-                    ph -= 0.12
-                elif res_h is False:
-                    ph += 0.15
-
-                if res_a is True:
-                    pa -= 0.12
-                elif res_a is False:
-                    pa += 0.15
-
-                # 💣 FATIGA REAL
-                ph -= 0.04
-                pa -= 0.04
-
-                # NORMALIZAR
-                total = ph + pa
-                ph /= total
-                pa /= total
-
-                vh,va=value(ph,ch),value(pa,ca)
-
-                if vh>va:
-                    pick=h["name"]; cuota=ch; val=vh
-                else:
-                    pick=a["name"]; cuota=ca; val=va
-
-                txt=(
-                    f"⚾ {a['name']} @ {h['name']}\n\n"
-                    f"💰 {cuota}\n"
-                    f"📈 +{round(val*100,1)}%\n\n"
-                    f"🏆 {pick}\n\n"
-                    f"🔥 MODELO CONTEXTUAL ACTIVO"
-                )
-
-                await q.edit_message_text(txt)
-                return
-
-# ---------------- PICKS ----------------
-async def picks(update,context):
-    data=await get_json(f"{MLB_BASE}/schedule",{"sportId":"1"})
-    odds=await get_odds()
-    txt="🔥 PICKS CONTEXTUALES\n\n"
-
-    for d in data.get("dates",[]):
-        for g in d.get("games",[]):
-
-            h=g["teams"]["home"]["team"]
-            a=g["teams"]["away"]["team"]
-
-            ch,ca=buscar_cuota(h["name"],a["name"],odds)
-            if not ch or ch>5 or ca>5: continue
-
-            era_h,era_a,ops_h,ops_a,res_h,res_a=await asyncio.gather(
-                era_pitcher(h.get("probablePitcher",{}).get("id")),
-                era_pitcher(a.get("probablePitcher",{}).get("id")),
-                ops(h["id"]),ops(a["id"]),
-                resultado_ayer(h["id"]),
-                resultado_ayer(a["id"])
-            )
-
-            ph=prob_model(era_h,era_a,ops_h,ops_a)
-            pa=1-ph
-
-            # 💣 CLAVE
-            if res_h is True: ph -= 0.12
-            elif res_h is False: ph += 0.15
-
-            if res_a is True: pa -= 0.12
-            elif res_a is False: pa += 0.15
-
-            ph -= 0.04
-            pa -= 0.04
-
-            total = ph + pa
-            ph /= total
-            pa /= total
-
-            vh,va=value(ph,ch),value(pa,ca)
-
-            if vh>va:
-                pick=h["name"]; cuota=ch; val=vh
+            if g["home_team"].lower() == home.lower():
+                o = g["bookmakers"][0]["markets"][0]["outcomes"]
+                return o[0]["price"], o[1]["price"]
+        except Exception:
+            pass
+    return None, None
+ 
+# ================= ANALISIS =================
+async def analizar(g, odds_data):
+    """
+    Recibe el partido y los odds ya cargados (no los vuelve a pedir).
+    Devuelve: (local, visitante, pick, cuota, value, game_id) o None.
+    """
+    h = g["teams"]["home"]["team"]
+    a = g["teams"]["away"]["team"]
+    game_id = str(g.get("gamePk", ""))
+ 
+    ch, ca = cuota(h["name"], odds_data)
+    if not ch:
+        logger.debug(f"Sin odds para {h['name']} vs {a['name']}, se omite")
+        return None
+ 
+    # Obtener pitcher IDs de forma segura
+    pid_h = g["teams"]["home"].get("probablePitcher", {}).get("id")
+    pid_a = g["teams"]["away"].get("probablePitcher", {}).get("id")
+ 
+    (era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra, res_h, res_a) = await asyncio.gather(
+        era(pid_h),
+        era(pid_a),
+        ops(h["id"]),
+        ops(a["id"]),
+        bullpen(h["id"]),
+        bullpen(a["id"]),
+        racha(h["id"]),
+        racha(a["id"]),
+        resultado_ayer(h["id"]),
+        resultado_ayer(a["id"])
+    )
+ 
+    ph = modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra)
+    pa = 1 - ph
+ 
+    if res_h is False:
+        ph *= 1.15
+    if res_a is False:
+        pa *= 1.15
+ 
+    ph, pa = ph / (ph + pa), pa / (ph + pa)
+ 
+    vh, va = value(ph, ch), value(pa, ca)
+ 
+    if vh > va:
+        return h["name"], a["name"], h["name"], ch, vh, game_id
+    else:
+        return h["name"], a["name"], a["name"], ca, va, game_id
+ 
+# ================= PERSISTENCIA =================
+async def guardar_pick(local, visitante, pick, cuota_val, prob, val, game_id):
+    """Guarda un pick en la DB, evitando duplicados por game_id."""
+    async with pool.acquire() as conn:
+        existe = await conn.fetchval(
+            "SELECT id FROM historial WHERE game_id = $1", game_id
+        )
+        if existe:
+            logger.info(f"Pick para game_id {game_id} ya existe, se omite")
+            return
+ 
+        await conn.execute("""
+            INSERT INTO historial (game_id, local, visitante, pick, cuota, prob, value)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """, game_id, local, visitante, pick, cuota_val, prob, val)
+        logger.info(f"Pick guardado: {pick} @ {cuota_val} (value {round(val*100,1)}%)")
+ 
+async def actualizar_resultados():
+    """
+    Corre una vez al día. Busca picks PENDIENTES de ayer,
+    consulta el resultado real y actualiza resultado + profit.
+    Profit calculado como: cuota - 1 si ganó, -1 si perdió (stake=1u).
+    """
+    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+ 
+    async with pool.acquire() as conn:
+        pendientes = await conn.fetch("""
+            SELECT id, game_id, pick, cuota
+            FROM historial
+            WHERE resultado = 'PENDIENTE'
+              AND fecha::date = $1
+        """, datetime.strptime(ayer, "%Y-%m-%d").date())
+ 
+    if not pendientes:
+        logger.info("Sin picks pendientes para actualizar")
+        return
+ 
+    try:
+        schedule = await get_json(f"{MLB}/schedule", {"sportId": 1, "date": ayer})
+    except Exception as e:
+        logger.error(f"Error obteniendo schedule de ayer: {e}")
+        return
+ 
+    resultados_map = {}
+    for d in schedule.get("dates", []):
+        for g in d.get("games", []):
+            if g["status"]["detailedState"] == "Final":
+                gid = str(g["gamePk"])
+                h = g["teams"]["home"]
+                a = g["teams"]["away"]
+                winner = h["team"]["name"] if h["isWinner"] else a["team"]["name"]
+                resultados_map[gid] = winner
+ 
+    async with pool.acquire() as conn:
+        for row in pendientes:
+            winner = resultados_map.get(row["game_id"])
+            if not winner:
+                logger.warning(f"No se encontró resultado para game_id {row['game_id']}")
+                continue
+ 
+            if winner.lower() == row["pick"].lower():
+                resultado = "WIN"
+                profit = round(row["cuota"] - 1, 3)
             else:
-                pick=a["name"]; cuota=ca; val=va
-
-            if val < 0.05 or val > 0.25: continue
-
-            txt+=f"{a['name']} @ {h['name']}\n🏆 {pick}\n💰 {cuota} | +{round(val*100,1)}%\n\n"
-
-    await update.message.reply_text(txt if txt!="🔥 PICKS CONTEXTUALES\n\n" else "No hay value")
-
-# ---------------- MAIN ----------------
-if __name__=="__main__":
-    app=ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("BOT ON",reply_markup=MENU)))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: picks(u,c) if "Picks" in u.message.text else partidos(u,c)))
-    app.add_handler(CallbackQueryHandler(detalle,pattern="g_"))
-    app.run_polling()
+                resultado = "LOSS"
+                profit = -1.0
+ 
+            await conn.execute("""
+                UPDATE historial SET resultado = $1, profit = $2 WHERE id = $3
+            """, resultado, profit, row["id"])
+            logger.info(f"Pick {row['id']} actualizado: {resultado} | profit: {profit}")
+ 
+# ================= TELEGRAM =================
+menu = ReplyKeyboardMarkup([
+    ["📈 Picks", "📊 ROI"],
+    ["📜 Historial"]
+], resize_keyboard=True)
+ 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 SISTEMA PRO ACTIVO", reply_markup=menu)
+ 
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Analizando partidos...")
+ 
+    try:
+        schedule_data = await get_json(f"{MLB}/schedule", {"sportId": "1"})
+    except Exception as e:
+        logger.error(f"Error obteniendo schedule: {e}")
+        await update.message.reply_text("❌ Error obteniendo el calendario. Intentá más tarde.")
+        return
+ 
+    # Obtener odds UNA SOLA VEZ para todos los partidos
+    odds_data = await get_odds()
+    if not odds_data:
+        await update.message.reply_text("❌ Error obteniendo las cuotas. Intentá más tarde.")
+        return
+ 
+    txt = "🔥 PICKS DEL DÍA\n\n"
+    picks_encontrados = 0
+ 
+    for d in schedule_data.get("dates", []):
+        for g in d.get("games", []):
+            try:
+                r = await analizar(g, odds_data)
+            except Exception as e:
+                logger.error(f"Error analizando partido: {e}")
+                continue
+ 
+            if not r:
+                continue
+ 
+            local, visitante, pick, cu, val, game_id = r
+ 
+            if val < 0.03:
+                continue
+ 
+            picks_encontrados += 1
+            txt += f"🏟 {visitante} @ {local}\n"
+            txt += f"🏆 Pick: {pick}\n"
+            txt += f"💰 Cuota: {cu} | Value: {round(val*100, 1)}%\n\n"
+ 
+            # Guardar en DB
+            await guardar_pick(local, visitante, pick, cu, 0.0, val, game_id)
+ 
+    if picks_encontrados == 0:
+        txt += "Sin picks con value suficiente hoy."
+ 
+    await update.message.reply_text(txt)
+ 
+async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM historial ORDER BY id DESC LIMIT 10"
+        )
+ 
+    if not rows:
+        await update.message.reply_text("📜 Sin historial todavía.")
+        return
+ 
+    txt = "📜 ÚLTIMOS 10 PICKS\n\n"
+    for r in rows:
+        emoji = "✅" if r["resultado"] == "WIN" else ("❌" if r["resultado"] == "LOSS" else "⏳")
+        profit_str = f"+{r['profit']:.2f}u" if r["profit"] > 0 else f"{r['profit']:.2f}u"
+        txt += f"{emoji} {r['local']} vs {r['visitante']}\n"
+        txt += f"   Pick: {r['pick']} @ {r['cuota']} → {r['resultado']} ({profit_str})\n\n"
+ 
+    await update.message.reply_text(txt)
+ 
+async def cmd_roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT resultado, profit FROM historial WHERE resultado != 'PENDIENTE'"
+        )
+ 
+    if not rows:
+        await update.message.reply_text("📊 Sin datos resueltos todavía.")
+        return
+ 
+    total_profit = sum(r["profit"] for r in rows)
+    total = len(rows)
+    wins = sum(1 for r in rows if r["resultado"] == "WIN")
+    winrate = round(wins / total * 100, 1) if total else 0
+ 
+    txt = (
+        f"📊 ESTADÍSTICAS\n\n"
+        f"Total picks: {total}\n"
+        f"Ganados: {wins} ({winrate}%)\n"
+        f"Profit total: {'+' if total_profit >= 0 else ''}{round(total_profit, 2)}u\n"
+        f"ROI: {round(total_profit / total * 100, 1)}%"
+    )
+    await update.message.reply_text(txt)
+ 
+# ================= JOB DIARIO =================
+async def job_actualizar_resultados(context: ContextTypes.DEFAULT_TYPE):
+    """Se ejecuta automáticamente cada día a las 8 AM."""
+    logger.info("Ejecutando actualización diaria de resultados...")
+    await actualizar_resultados()
+ 
+# ================= MAIN =================
+async def main():
+    await init_db()
+ 
+    app = ApplicationBuilder().token(TOKEN).build()
+ 
+    # Handlers con regex case-insensitive
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)picks"), cmd_picks))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)historial"), cmd_historial))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)roi"), cmd_roi))
+ 
+    # Job diario para actualizar resultados a las 8 AM UTC
+    app.job_queue.run_daily(
+        job_actualizar_resultados,
+        time=datetime.strptime("08:00", "%H:%M").time()
+    )
+ 
+    logger.info("Bot iniciado")
+    await app.run_polling()  # await correcto para modo async
+ 
+if __name__ == "__main__":
+    asyncio.run(main())
