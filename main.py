@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-DB_PATH = os.getenv("DB_PATH", "bot.db")  # archivo local SQLite
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 MLB = "https://statsapi.mlb.com/api/v1"
 
 # ================= DB =================
-async def init_db():
+async def init_db(_app=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS historial (
@@ -89,13 +89,11 @@ async def racha(team):
 
     wins = 0
     games = 0
-
     for d in data.get("dates", []):
         for g in d.get("games", []):
             if g["status"]["detailedState"] == "Final":
                 h = g["teams"]["home"]
                 a = g["teams"]["away"]
-
                 if h["team"]["id"] == team:
                     games += 1
                     if h["isWinner"]:
@@ -120,7 +118,6 @@ async def resultado_ayer(team):
             if g["status"]["detailedState"] == "Final":
                 h = g["teams"]["home"]
                 a = g["teams"]["away"]
-
                 if h["team"]["id"] == team:
                     return h["isWinner"]
                 if a["team"]["id"] == team:
@@ -141,7 +138,6 @@ def value(prob, cuota):
 
 # ================= ODDS =================
 async def get_odds():
-    """Llama a la API una sola vez y devuelve todos los datos."""
     try:
         return await get_json(
             "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds",
@@ -163,10 +159,6 @@ def cuota(home, data):
 
 # ================= ANALISIS =================
 async def analizar(g, odds_data):
-    """
-    Recibe el partido y los odds ya cargados (no los vuelve a pedir).
-    Devuelve: (local, visitante, pick, cuota, value, game_id) o None.
-    """
     h = g["teams"]["home"]["team"]
     a = g["teams"]["away"]["team"]
     game_id = str(g.get("gamePk", ""))
@@ -176,21 +168,15 @@ async def analizar(g, odds_data):
         logger.debug(f"Sin odds para {h['name']} vs {a['name']}, se omite")
         return None
 
-    # Obtener pitcher IDs de forma segura
     pid_h = g["teams"]["home"].get("probablePitcher", {}).get("id")
     pid_a = g["teams"]["away"].get("probablePitcher", {}).get("id")
 
     (era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra, res_h, res_a) = await asyncio.gather(
-        era(pid_h),
-        era(pid_a),
-        ops(h["id"]),
-        ops(a["id"]),
-        bullpen(h["id"]),
-        bullpen(a["id"]),
-        racha(h["id"]),
-        racha(a["id"]),
-        resultado_ayer(h["id"]),
-        resultado_ayer(a["id"])
+        era(pid_h), era(pid_a),
+        ops(h["id"]), ops(a["id"]),
+        bullpen(h["id"]), bullpen(a["id"]),
+        racha(h["id"]), racha(a["id"]),
+        resultado_ayer(h["id"]), resultado_ayer(a["id"])
     )
 
     ph = modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra)
@@ -202,7 +188,6 @@ async def analizar(g, odds_data):
         pa *= 1.15
 
     ph, pa = ph / (ph + pa), pa / (ph + pa)
-
     vh, va = value(ph, ch), value(pa, ca)
 
     if vh > va:
@@ -212,7 +197,6 @@ async def analizar(g, odds_data):
 
 # ================= PERSISTENCIA =================
 async def guardar_pick(local, visitante, pick, cuota_val, prob, val, game_id):
-    """Guarda un pick en la DB, evitando duplicados por game_id (UNIQUE)."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
@@ -225,20 +209,13 @@ async def guardar_pick(local, visitante, pick, cuota_val, prob, val, game_id):
         logger.error(f"Error guardando pick {game_id}: {e}")
 
 async def actualizar_resultados():
-    """
-    Corre una vez al día. Busca picks PENDIENTES de ayer,
-    consulta el resultado real y actualiza resultado + profit.
-    Profit calculado como: cuota - 1 si ganó, -1 si perdió (stake=1u).
-    """
     ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT id, game_id, pick, cuota
-            FROM historial
-            WHERE resultado = 'PENDIENTE'
-              AND date(fecha) = ?
+            SELECT id, game_id, pick, cuota FROM historial
+            WHERE resultado = 'PENDIENTE' AND date(fecha) = ?
         """, (ayer,)) as cursor:
             pendientes = await cursor.fetchall()
 
@@ -259,28 +236,25 @@ async def actualizar_resultados():
                 gid = str(g["gamePk"])
                 h = g["teams"]["home"]
                 a = g["teams"]["away"]
-                winner = h["team"]["name"] if h["isWinner"] else a["team"]["name"]
-                resultados_map[gid] = winner
+                resultados_map[gid] = h["team"]["name"] if h["isWinner"] else a["team"]["name"]
 
     async with aiosqlite.connect(DB_PATH) as db:
         for row in pendientes:
             winner = resultados_map.get(row["game_id"])
             if not winner:
-                logger.warning(f"No se encontró resultado para game_id {row['game_id']}")
+                logger.warning(f"Sin resultado para game_id {row['game_id']}")
                 continue
 
             if winner.lower() == row["pick"].lower():
-                resultado = "WIN"
-                profit = round(row["cuota"] - 1, 3)
+                resultado, profit = "WIN", round(row["cuota"] - 1, 3)
             else:
-                resultado = "LOSS"
-                profit = -1.0
+                resultado, profit = "LOSS", -1.0
 
             await db.execute(
                 "UPDATE historial SET resultado = ?, profit = ? WHERE id = ?",
                 (resultado, profit, row["id"])
             )
-            logger.info(f"Pick {row['id']} actualizado: {resultado} | profit: {profit}")
+            logger.info(f"Pick {row['id']}: {resultado} | profit: {profit}")
         await db.commit()
 
 # ================= TELEGRAM =================
@@ -302,7 +276,6 @@ async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error obteniendo el calendario. Intentá más tarde.")
         return
 
-    # Obtener odds UNA SOLA VEZ para todos los partidos
     odds_data = await get_odds()
     if not odds_data:
         await update.message.reply_text("❌ Error obteniendo las cuotas. Intentá más tarde.")
@@ -332,7 +305,6 @@ async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txt += f"🏆 Pick: {pick}\n"
             txt += f"💰 Cuota: {cu} | Value: {round(val*100, 1)}%\n\n"
 
-            # Guardar en DB
             await guardar_pick(local, visitante, pick, cu, 0.0, val, game_id)
 
     if picks_encontrados == 0:
@@ -389,30 +361,30 @@ async def cmd_roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= JOB DIARIO =================
 async def job_actualizar_resultados(context: ContextTypes.DEFAULT_TYPE):
-    """Se ejecuta automáticamente cada día a las 8 AM."""
-    logger.info("Ejecutando actualización diaria de resultados...")
+    logger.info("Ejecutando actualizacion diaria de resultados...")
     await actualizar_resultados()
 
 # ================= MAIN =================
-async def main():
-    await init_db()
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(init_db)   # init_db corre dentro del event loop de PTB
+        .build()
+    )
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Handlers con regex case-insensitive
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)picks"), cmd_picks))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)historial"), cmd_historial))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)roi"), cmd_roi))
 
-    # Job diario para actualizar resultados a las 8 AM UTC
     app.job_queue.run_daily(
         job_actualizar_resultados,
         time=datetime.strptime("08:00", "%H:%M").time()
     )
 
     logger.info("Bot iniciado")
-    await app.run_polling()  # await correcto para modo async
+    app.run_polling()   # sincronico — PTB maneja su propio event loop
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
