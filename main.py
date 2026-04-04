@@ -2,36 +2,31 @@ import os
 import logging
 import asyncio
 import httpx
-import asyncpg
+import aiosqlite
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
- 
+
 # ================= CONFIG =================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
- 
+
 TOKEN = os.getenv("TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "bot.db")  # archivo local SQLite
 MLB = "https://statsapi.mlb.com/api/v1"
- 
-pool = None
- 
+
 # ================= DB =================
 async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
- 
-    async with pool.acquire() as conn:
-        await conn.execute("""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS historial (
-            id SERIAL PRIMARY KEY,
-            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            game_id TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha TEXT DEFAULT (datetime('now')),
+            game_id TEXT UNIQUE,
             local TEXT,
             visitante TEXT,
             pick TEXT,
@@ -40,17 +35,18 @@ async def init_db():
             value REAL,
             resultado TEXT DEFAULT 'PENDIENTE',
             profit REAL DEFAULT 0
-        );
+        )
         """)
+        await db.commit()
     logger.info("DB inicializada correctamente")
- 
+
 # ================= HTTP =================
 async def get_json(url, params=None):
     async with httpx.AsyncClient(timeout=10) as c:
         resp = await c.get(url, params=params)
         resp.raise_for_status()
         return resp.json()
- 
+
 # ================= STATS =================
 async def era(pid):
     if not pid:
@@ -62,7 +58,7 @@ async def era(pid):
     except Exception as e:
         logger.warning(f"Error obteniendo ERA para pitcher {pid}: {e}")
         return 4.50
- 
+
 async def ops(team):
     try:
         d = await get_json(f"{MLB}/teams/{team}/stats", {"stats": "season", "group": "hitting"})
@@ -70,7 +66,7 @@ async def ops(team):
     except Exception as e:
         logger.warning(f"Error obteniendo OPS para equipo {team}: {e}")
         return 0.720
- 
+
 async def bullpen(team):
     try:
         d = await get_json(
@@ -81,7 +77,7 @@ async def bullpen(team):
     except Exception as e:
         logger.warning(f"Error obteniendo bullpen ERA para equipo {team}: {e}")
         return 4.20
- 
+
 # ================= CONTEXTO =================
 async def racha(team):
     start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -90,16 +86,16 @@ async def racha(team):
     except Exception as e:
         logger.warning(f"Error obteniendo racha para equipo {team}: {e}")
         return 0.5
- 
+
     wins = 0
     games = 0
- 
+
     for d in data.get("dates", []):
         for g in d.get("games", []):
             if g["status"]["detailedState"] == "Final":
                 h = g["teams"]["home"]
                 a = g["teams"]["away"]
- 
+
                 if h["team"]["id"] == team:
                     games += 1
                     if h["isWinner"]:
@@ -108,9 +104,9 @@ async def racha(team):
                     games += 1
                     if a["isWinner"]:
                         wins += 1
- 
+
     return wins / games if games else 0.5
- 
+
 async def resultado_ayer(team):
     ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     try:
@@ -118,19 +114,19 @@ async def resultado_ayer(team):
     except Exception as e:
         logger.warning(f"Error obteniendo resultado de ayer para equipo {team}: {e}")
         return None
- 
+
     for d in data.get("dates", []):
         for g in d.get("games", []):
             if g["status"]["detailedState"] == "Final":
                 h = g["teams"]["home"]
                 a = g["teams"]["away"]
- 
+
                 if h["team"]["id"] == team:
                     return h["isWinner"]
                 if a["team"]["id"] == team:
                     return a["isWinner"]
     return None
- 
+
 # ================= MODELO =================
 def modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, r_h, r_a):
     score = 0.5
@@ -139,10 +135,10 @@ def modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, r_h, r_a):
     score += (bp_a - bp_h) * 0.06
     score += (r_h - r_a) * 0.25
     return max(min(score, 0.80), 0.20)
- 
+
 def value(prob, cuota):
     return prob - (1 / cuota)
- 
+
 # ================= ODDS =================
 async def get_odds():
     """Llama a la API una sola vez y devuelve todos los datos."""
@@ -154,7 +150,7 @@ async def get_odds():
     except Exception as e:
         logger.error(f"Error obteniendo odds: {e}")
         return []
- 
+
 def cuota(home, data):
     for g in data:
         try:
@@ -164,7 +160,7 @@ def cuota(home, data):
         except Exception:
             pass
     return None, None
- 
+
 # ================= ANALISIS =================
 async def analizar(g, odds_data):
     """
@@ -174,16 +170,16 @@ async def analizar(g, odds_data):
     h = g["teams"]["home"]["team"]
     a = g["teams"]["away"]["team"]
     game_id = str(g.get("gamePk", ""))
- 
+
     ch, ca = cuota(h["name"], odds_data)
     if not ch:
         logger.debug(f"Sin odds para {h['name']} vs {a['name']}, se omite")
         return None
- 
+
     # Obtener pitcher IDs de forma segura
     pid_h = g["teams"]["home"].get("probablePitcher", {}).get("id")
     pid_a = g["teams"]["away"].get("probablePitcher", {}).get("id")
- 
+
     (era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra, res_h, res_a) = await asyncio.gather(
         era(pid_h),
         era(pid_a),
@@ -196,41 +192,38 @@ async def analizar(g, odds_data):
         resultado_ayer(h["id"]),
         resultado_ayer(a["id"])
     )
- 
+
     ph = modelo(era_h, era_a, ops_h, ops_a, bp_h, bp_a, rh, ra)
     pa = 1 - ph
- 
+
     if res_h is False:
         ph *= 1.15
     if res_a is False:
         pa *= 1.15
- 
+
     ph, pa = ph / (ph + pa), pa / (ph + pa)
- 
+
     vh, va = value(ph, ch), value(pa, ca)
- 
+
     if vh > va:
         return h["name"], a["name"], h["name"], ch, vh, game_id
     else:
         return h["name"], a["name"], a["name"], ca, va, game_id
- 
+
 # ================= PERSISTENCIA =================
 async def guardar_pick(local, visitante, pick, cuota_val, prob, val, game_id):
-    """Guarda un pick en la DB, evitando duplicados por game_id."""
-    async with pool.acquire() as conn:
-        existe = await conn.fetchval(
-            "SELECT id FROM historial WHERE game_id = $1", game_id
-        )
-        if existe:
-            logger.info(f"Pick para game_id {game_id} ya existe, se omite")
-            return
- 
-        await conn.execute("""
-            INSERT INTO historial (game_id, local, visitante, pick, cuota, prob, value)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """, game_id, local, visitante, pick, cuota_val, prob, val)
+    """Guarda un pick en la DB, evitando duplicados por game_id (UNIQUE)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT OR IGNORE INTO historial (game_id, local, visitante, pick, cuota, prob, value)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (game_id, local, visitante, pick, cuota_val, prob, val))
+            await db.commit()
         logger.info(f"Pick guardado: {pick} @ {cuota_val} (value {round(val*100,1)}%)")
- 
+    except Exception as e:
+        logger.error(f"Error guardando pick {game_id}: {e}")
+
 async def actualizar_resultados():
     """
     Corre una vez al día. Busca picks PENDIENTES de ayer,
@@ -238,25 +231,27 @@ async def actualizar_resultados():
     Profit calculado como: cuota - 1 si ganó, -1 si perdió (stake=1u).
     """
     ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
- 
-    async with pool.acquire() as conn:
-        pendientes = await conn.fetch("""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
             SELECT id, game_id, pick, cuota
             FROM historial
             WHERE resultado = 'PENDIENTE'
-              AND fecha::date = $1
-        """, datetime.strptime(ayer, "%Y-%m-%d").date())
- 
+              AND date(fecha) = ?
+        """, (ayer,)) as cursor:
+            pendientes = await cursor.fetchall()
+
     if not pendientes:
         logger.info("Sin picks pendientes para actualizar")
         return
- 
+
     try:
         schedule = await get_json(f"{MLB}/schedule", {"sportId": 1, "date": ayer})
     except Exception as e:
         logger.error(f"Error obteniendo schedule de ayer: {e}")
         return
- 
+
     resultados_map = {}
     for d in schedule.get("dates", []):
         for g in d.get("games", []):
@@ -266,54 +261,56 @@ async def actualizar_resultados():
                 a = g["teams"]["away"]
                 winner = h["team"]["name"] if h["isWinner"] else a["team"]["name"]
                 resultados_map[gid] = winner
- 
-    async with pool.acquire() as conn:
+
+    async with aiosqlite.connect(DB_PATH) as db:
         for row in pendientes:
             winner = resultados_map.get(row["game_id"])
             if not winner:
                 logger.warning(f"No se encontró resultado para game_id {row['game_id']}")
                 continue
- 
+
             if winner.lower() == row["pick"].lower():
                 resultado = "WIN"
                 profit = round(row["cuota"] - 1, 3)
             else:
                 resultado = "LOSS"
                 profit = -1.0
- 
-            await conn.execute("""
-                UPDATE historial SET resultado = $1, profit = $2 WHERE id = $3
-            """, resultado, profit, row["id"])
+
+            await db.execute(
+                "UPDATE historial SET resultado = ?, profit = ? WHERE id = ?",
+                (resultado, profit, row["id"])
+            )
             logger.info(f"Pick {row['id']} actualizado: {resultado} | profit: {profit}")
- 
+        await db.commit()
+
 # ================= TELEGRAM =================
 menu = ReplyKeyboardMarkup([
     ["📈 Picks", "📊 ROI"],
     ["📜 Historial"]
 ], resize_keyboard=True)
- 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔥 SISTEMA PRO ACTIVO", reply_markup=menu)
- 
+
 async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Analizando partidos...")
- 
+
     try:
         schedule_data = await get_json(f"{MLB}/schedule", {"sportId": "1"})
     except Exception as e:
         logger.error(f"Error obteniendo schedule: {e}")
         await update.message.reply_text("❌ Error obteniendo el calendario. Intentá más tarde.")
         return
- 
+
     # Obtener odds UNA SOLA VEZ para todos los partidos
     odds_data = await get_odds()
     if not odds_data:
         await update.message.reply_text("❌ Error obteniendo las cuotas. Intentá más tarde.")
         return
- 
+
     txt = "🔥 PICKS DEL DÍA\n\n"
     picks_encontrados = 0
- 
+
     for d in schedule_data.get("dates", []):
         for g in d.get("games", []):
             try:
@@ -321,62 +318,66 @@ async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error analizando partido: {e}")
                 continue
- 
+
             if not r:
                 continue
- 
+
             local, visitante, pick, cu, val, game_id = r
- 
+
             if val < 0.03:
                 continue
- 
+
             picks_encontrados += 1
             txt += f"🏟 {visitante} @ {local}\n"
             txt += f"🏆 Pick: {pick}\n"
             txt += f"💰 Cuota: {cu} | Value: {round(val*100, 1)}%\n\n"
- 
+
             # Guardar en DB
             await guardar_pick(local, visitante, pick, cu, 0.0, val, game_id)
- 
+
     if picks_encontrados == 0:
         txt += "Sin picks con value suficiente hoy."
- 
+
     await update.message.reply_text(txt)
- 
+
 async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
             "SELECT * FROM historial ORDER BY id DESC LIMIT 10"
-        )
- 
+        ) as cursor:
+            rows = await cursor.fetchall()
+
     if not rows:
         await update.message.reply_text("📜 Sin historial todavía.")
         return
- 
+
     txt = "📜 ÚLTIMOS 10 PICKS\n\n"
     for r in rows:
         emoji = "✅" if r["resultado"] == "WIN" else ("❌" if r["resultado"] == "LOSS" else "⏳")
         profit_str = f"+{r['profit']:.2f}u" if r["profit"] > 0 else f"{r['profit']:.2f}u"
         txt += f"{emoji} {r['local']} vs {r['visitante']}\n"
         txt += f"   Pick: {r['pick']} @ {r['cuota']} → {r['resultado']} ({profit_str})\n\n"
- 
+
     await update.message.reply_text(txt)
- 
+
 async def cmd_roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
             "SELECT resultado, profit FROM historial WHERE resultado != 'PENDIENTE'"
-        )
- 
+        ) as cursor:
+            rows = await cursor.fetchall()
+
     if not rows:
         await update.message.reply_text("📊 Sin datos resueltos todavía.")
         return
- 
+
     total_profit = sum(r["profit"] for r in rows)
     total = len(rows)
     wins = sum(1 for r in rows if r["resultado"] == "WIN")
     winrate = round(wins / total * 100, 1) if total else 0
- 
+
     txt = (
         f"📊 ESTADÍSTICAS\n\n"
         f"Total picks: {total}\n"
@@ -385,33 +386,33 @@ async def cmd_roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ROI: {round(total_profit / total * 100, 1)}%"
     )
     await update.message.reply_text(txt)
- 
+
 # ================= JOB DIARIO =================
 async def job_actualizar_resultados(context: ContextTypes.DEFAULT_TYPE):
     """Se ejecuta automáticamente cada día a las 8 AM."""
     logger.info("Ejecutando actualización diaria de resultados...")
     await actualizar_resultados()
- 
+
 # ================= MAIN =================
 async def main():
     await init_db()
- 
+
     app = ApplicationBuilder().token(TOKEN).build()
- 
+
     # Handlers con regex case-insensitive
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)picks"), cmd_picks))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)historial"), cmd_historial))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)roi"), cmd_roi))
- 
+
     # Job diario para actualizar resultados a las 8 AM UTC
     app.job_queue.run_daily(
         job_actualizar_resultados,
         time=datetime.strptime("08:00", "%H:%M").time()
     )
- 
+
     logger.info("Bot iniciado")
     await app.run_polling()  # await correcto para modo async
- 
+
 if __name__ == "__main__":
     asyncio.run(main())
